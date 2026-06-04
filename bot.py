@@ -5,8 +5,9 @@ import threading
 import json
 import os
 import sys
+import dotenv
 
-load_dotenv()
+dotenv.load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 CHANNEL_FILE = "channels.json"
