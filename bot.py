@@ -1,154 +1,76 @@
 import discord
 from discord.ext import commands
-import asyncio
-import threading
-import json
 import os
-import sys
-import dotenv
+import threading
+from dotenv import load_dotenv
+from fastapi import FastAPI
+import uvicorn
+import asyncio
 
-dotenv.load_dotenv()
+load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-CHANNEL_FILE = "channels.json"
-
-
-# ----------------------------
-# Persistent channel registry
-# ----------------------------
-def load_channels():
-    if not os.path.exists(CHANNEL_FILE):
-        return {}
-    with open(CHANNEL_FILE, "r") as f:
-        return json.load(f)
-
-
-def save_channels(data):
-    with open(CHANNEL_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-channels = load_channels()
-
-
-# ----------------------------
-# Discord setup
-# ----------------------------
 intents = discord.Intents.default()
 intents.message_content = True
+intents.guilds = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# -----------------------
+# In-memory cache
+# -----------------------
+guild_cache = {}   # guild_id -> guild_name
+channel_cache = {} # guild_id -> list of (channel_id, name)
 
+# -----------------------
+# Discord events
+# -----------------------
 @bot.event
 async def on_ready():
-    print(f"[BOT] Logged in as {bot.user} ({bot.user.id})")
-    print("[BOT] Ready for CLI commands: send <message>")
+    print(f"Logged in as {bot.user}")
+
+    for g in bot.guilds:
+        guild_cache[g.id] = g.name
+        channel_cache[g.id] = [
+            (c.id, c.name)
+            for c in g.text_channels
+        ]
 
 
-# ----------------------------
-# Optional: register channel
-# ----------------------------
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def register(ctx):
-    """Registers the current channel as a broadcast target"""
-    guild_id = str(ctx.guild.id)
-    channel_id = ctx.channel.id
+# -----------------------
+# IPC API (FastAPI)
+# -----------------------
+app = FastAPI()
 
-    channels[guild_id] = channel_id
-    save_channels(channels)
+@app.get("/guilds")
+def get_guilds():
+    return guild_cache
 
-    await ctx.send("✅ This channel is now registered for broadcasts.")
+@app.get("/channels/{guild_id}")
+def get_channels(guild_id: int):
+    return channel_cache.get(guild_id, [])
 
+@app.post("/send")
+def send_message(payload: dict):
+    guild_id = payload["guild_id"]
+    channel_id = payload["channel_id"]
+    message = payload["message"]
 
-# ----------------------------
-# Broadcast logic
-# ----------------------------
-async def broadcast_message(message: str):
-    if not channels:
-        print("[WARN] No channels registered.")
-        return
-
-    print("\n[BROADCAST PLAN]")
-    targets = []
-
-    for guild_id, channel_id in channels.items():
-        guild = bot.get_guild(int(guild_id))
-        if not guild:
-            continue
-
-        channel = guild.get_channel(channel_id)
-        if not channel:
-            continue
-
-        targets.append(channel)
-        print(f"- {guild.name} -> #{channel.name}")
-
-    if not targets:
-        print("[WARN] No valid channels found.")
-        return
-
-    confirm = input("\nType YES to send: ")
-    if confirm != "YES":
-        print("Cancelled.")
-        return
-
-    for channel in targets:
-        try:
+    async def _send():
+        channel = bot.get_channel(channel_id)
+        if channel:
             await channel.send(message)
-        except Exception as e:
-            print(f"[ERROR] Failed in {channel}: {e}")
 
-    print("[DONE] Message sent.")
-
-
-# ----------------------------
-# CLI thread
-# ----------------------------
-def cli_loop():
-    while True:
-        try:
-            cmd = input("> ").strip()
-
-            if cmd.startswith("send "):
-                msg = cmd[len("send "):]
-
-                fut = asyncio.run_coroutine_threadsafe(
-                    broadcast_message(msg),
-                    bot.loop
-                )
-                fut.result()
-
-            elif cmd == "list":
-                print(json.dumps(channels, indent=2))
-
-            elif cmd.startswith("add "):
-                print("Use !register inside Discord instead.")
-
-            elif cmd in ("exit", "quit"):
-                print("Shutting down...")
-                os._exit(0)
-
-            else:
-                print("Commands: send <msg>, list, exit")
-
-        except Exception as e:
-            print(f"[CLI ERROR] {e}")
+    asyncio.run_coroutine_threadsafe(_send(), bot.loop)
+    return {"status": "sent"}
 
 
-# ----------------------------
-# Run bot + CLI
-# ----------------------------
-def start_cli():
-    thread = threading.Thread(target=cli_loop, daemon=True)
-    thread.start()
+# -----------------------
+# Run FastAPI in thread
+# -----------------------
+def run_api():
+    uvicorn.run(app, host="127.0.0.1", port=8000)
 
+threading.Thread(target=run_api, daemon=True).start()
 
-if __name__ == "__main__":
-    if not TOKEN:
-        print("Missing DISCORD_TOKEN env var")
-        sys.exit(1)
-
-    start_cli()
-    bot.run(TOKEN)
+bot.run(TOKEN)
